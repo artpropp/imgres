@@ -7,10 +7,12 @@ import (
 	"image/jpeg"
 	"io"
 	"io/ioutil"
+	"log"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/disintegration/imaging"
 )
@@ -47,6 +49,12 @@ func (e *errorList) Error() string {
 type picSize struct {
 	width  int
 	height int
+}
+
+type resizeArgs struct {
+	inPath  string
+	outPath string
+	size    picSize
 }
 
 func parseSize(s string) (picSize, error) {
@@ -120,31 +128,60 @@ func resizeFolderImages(inFolder, outFolder string, size picSize) error {
 	if err != nil {
 		return fmt.Errorf("Error trying to read directory: %w\n", err)
 	}
+
+	wg := &sync.WaitGroup{}
 	errList := &errorList{}
+	errChan := make(chan error)
+	resizeChan := make(chan resizeArgs)
+	wg.Add(3)
+	go resizer(wg, resizeChan, errChan)
+	go resizer(wg, resizeChan, errChan)
+	go resizer(wg, resizeChan, errChan)
+	go func(errList *errorList, errChan chan error) {
+		for err := range errChan {
+			errList.add(err)
+		}
+	}(errList, errChan)
+
 	for _, fi := range dir {
 		if fi.IsDir() || !useFile(fi.Name()) {
 			continue
 		}
 		inPath := filepath.Join(inFolder, fi.Name())
-		inFile, err := os.Open(inPath)
-		if err != nil {
-			errList.add(fmt.Errorf("Error opening file from %s: %s\n", inPath, err))
-			continue
-		}
 		outPath := filepath.Join(outFolder, fi.Name())
-		outFile, err := os.OpenFile(outPath, os.O_CREATE|os.O_WRONLY, 0644)
-		if err != nil {
-			errList.add(fmt.Errorf("Error creating file for %s: %s\n", outPath, err))
-		}
-		err = resize(size, inFile, outFile)
-		if err != nil {
-			errList.add(fmt.Errorf("Error resizing image from %s: %s\n", inPath, err))
-		}
-		inFile.Close()
-		outFile.Close()
+		resizeChan <- resizeArgs{inPath, outPath, size}
 	}
+	close(resizeChan)
+	close(errChan)
+	wg.Wait()
 	if errList.hasError() {
 		return errList
 	}
 	return nil
+}
+
+func resizeClose(ps picSize, r io.ReadCloser, w io.WriteCloser) error {
+	defer r.Close()
+	defer w.Close()
+	return resize(ps, r, w)
+}
+
+func resizer(wg *sync.WaitGroup, c chan resizeArgs, errChan chan error) {
+	for a := range c {
+		log.Println("Resize:", a.inPath)
+		inFile, err := os.Open(a.inPath)
+		if err != nil {
+			errChan <- fmt.Errorf("Error opening file from %s: %s\n", a.inPath, err)
+			continue
+		}
+		outFile, err := os.OpenFile(a.outPath, os.O_CREATE|os.O_WRONLY, 0644)
+		if err != nil {
+			errChan <- fmt.Errorf("Error creating file for %s: %s\n", a.outPath, err)
+		}
+		err = resizeClose(a.size, inFile, outFile)
+		if err != nil {
+			errChan <- fmt.Errorf("Error resizing image from %s: %s\n", a.inPath, err)
+		}
+	}
+	wg.Done()
 }
